@@ -1,56 +1,61 @@
 import streamlit as st
 import requests
+import uuid
+
+# 1. Initialize a unique session ID for this user's browser tab
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
 
 FASTAPI_URL = "http://localhost:8080"
 
 st.set_page_config(page_title="Llama + Gemini RAG App", layout="centered")
 st.title("📚 Llama & Gemini Flash RAG App")
-st.write("Upload clean files to S3 + Vector space, and generate validation references dynamically.")
+
+# Display session ID for debugging/verification (Optional, you can remove this later)
+st.caption(f"Session ID: {st.session_state.session_id[:8]}...")
 
 tab1, tab2 = st.tabs(["📤 Upload Document", "💬 Ask Questions"])
 
-# --- TAB 1: UPLOAD DOCUMENT ---
 with tab1:
     st.header("Upload Document")
     uploaded_file = st.file_uploader("Choose a PDF or TXT file", type=["pdf", "txt"])
-    
     if uploaded_file is not None:
         if st.button("Process & Index Document"):
-            with st.spinner("Uploading copy to S3 and embedding text with Llama..."):
+            with st.spinner("Uploading and isolating your document..."):
                 files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
+                # 2. Pass the session_id to the backend as form data
+                data = {"session_id": st.session_state.session_id} 
+                
                 try:
-                    response = requests.post(f"{FASTAPI_URL}/upload", files=files)
+                    response = requests.post(f"{FASTAPI_URL}/upload", files=files, data=data)
                     if response.status_code == 200:
                         st.success(response.json().get("message"))
                     else:
-                        st.error(f"Error from engine processing: {response.text}")
+                        st.error(f"Error: {response.text}")
                 except requests.exceptions.ConnectionError:
-                    st.error("Connection failure: Is the backend engine active on port 8080?")
+                    st.error("Could not connect to backend.")
 
-# --- TAB 2: ASK QUESTIONS ---
 with tab2:
     st.header("Ask your Document")
-    user_query = st.text_input("Enter your question based on uploaded documents:")
-    
+    user_query = st.text_input("Enter your question:")
     if st.button("Get Answer"):
         if not user_query.strip():
-            st.warning("Please input a valid inquiry phrase first.")
+            st.warning("Please enter a question.")
         else:
-            with st.spinner("Searching Pinecone and generating answer with Gemini..."):
+            with st.spinner("Generating answer..."):
                 try:
-                    response = requests.post(f"{FASTAPI_URL}/query", json={"query": user_query})
+                    # 3. Pass the session_id along with the query
+                    payload = {"query": user_query, "session_id": st.session_state.session_id}
+                    response = requests.post(f"{FASTAPI_URL}/query", json=payload)
+                    
                     if response.status_code == 200:
                         res_data = response.json()
-                        
                         st.subheader("Answer:")
                         st.markdown(res_data["answer"])
-                        
-                        st.write("---")
-                        with st.expander("🔍 View Context Sources Used by Gemini"):
+                        with st.expander("🔍 View Context Sources Used"):
                             for idx, chunk in enumerate(res_data["context_used"], 1):
-                                st.markdown(f"##### Source Chunk {idx}")
-                                st.markdown(f"> {chunk}")
+                                st.markdown(f"> **Chunk {idx}:** {chunk}")
                     else:
-                        st.error(f"Error payload generated: {response.text}")
+                        st.error(f"Error: {response.text}")
                 except requests.exceptions.ConnectionError:
-                    st.error("Unable to securely reach API parsing framework loops.")
+                    st.error("Backend connection failed.")

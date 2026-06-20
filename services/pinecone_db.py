@@ -17,8 +17,8 @@ if settings.PINECONE_INDEX_NAME not in pc.list_indexes().names():
 
 index = pc.Index(settings.PINECONE_INDEX_NAME)
 
-def upsert_chunks(chunks: list[str]):
-    """Embeds text chunks via Llama Inference and registers vectors to Pinecone."""
+def upsert_chunks(chunks: list[str], namespace: str):
+    """Embeds text chunks via Llama Inference and registers vectors to a specific Pinecone namespace."""
     if not chunks:
         return
         
@@ -37,11 +37,11 @@ def upsert_chunks(chunks: list[str]):
             "metadata": {"text": chunk}
         })
         
-    # Batch upsert elements into vector database index
-    index.upsert(vectors=records)
+    # Batch upsert elements into the specific user namespace
+    index.upsert(vectors=records, namespace=namespace)
 
-def query_similar_chunks(query: str, top_k: int = 3) -> list[str]:
-    """Converts user queries to embeddings and fetches the top related text records."""
+def query_similar_chunks(query: str, namespace: str, top_k: int = 3) -> list[str]:
+    """Converts user queries to embeddings and fetches the top related records strictly from their namespace."""
     query_embedding = pc.inference.embed(
         model="llama-text-embed-v2",
         inputs=[query],
@@ -51,7 +51,8 @@ def query_similar_chunks(query: str, top_k: int = 3) -> list[str]:
     results = index.query(
         vector=query_embedding.data[0].values,
         top_k=top_k,
-        include_metadata=True
+        include_metadata=True,
+        namespace=namespace
     )
     
     return [match.metadata["text"] for match in results.matches if match.metadata and "text" in match.metadata]
