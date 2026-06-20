@@ -1,13 +1,13 @@
-name: Deploy to Production EC2
+name: Deploy via Self-Hosted Runner
 
 on:
   push:
     branches:
-      - main  # Triggers the pipeline every time you push to the main branch
+      - main
 
 jobs:
-  build-and-deploy:
-    runs-on: ubuntu-latest
+  deploy:
+    runs-on: self-hosted  # This tells GitHub to run the job directly on your EC2 instance
 
     steps:
     - name: Checkout Code
@@ -16,56 +16,38 @@ jobs:
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
-        aws-access-key-id: ${{ secrets::AWS_ACCESS_KEY_ID }}
-        aws-secret-access-key: ${{ secrets::AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ secrets::AWS_REGION }}
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
 
     - name: Log in to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Build, Tag, and Push Docker Image to ECR
+    - name: Build, Tag, and Push Docker Image
       env:
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        ECR_REPOSITORY: ${{ secrets::ECR_REPOSITORY }}
+        ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
         IMAGE_TAG: latest
       run: |
         docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
         docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-
-    - name: Deploy to EC2 via SSH
-      uses: appleboy/ssh-action@v1.0.3
-      with:
-        host: ${{ secrets::EC2_HOST }}
-        username: ${{ secrets::EC2_USERNAME }}
-        key: ${{ secrets::EC2_SSH_KEY }}
-        script: |
-          # Install Docker on the EC2 instance if it is not already installed
-          if ! command -v docker &> /dev/null
-          then
-              sudo apt-get update -y
-              sudo apt-get install -y docker.io
-              sudo systemctl start docker
-              sudo systemctl enable docker
-              sudo usermod -aG docker ubuntu
-          fi
-
-          # Log into ECR inside the EC2 instance
-          aws ecr get-login-password --region ${{ secrets::AWS_REGION }} | docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}
-
-          # Stop and remove any older versions of the app running
-          docker stop rag-app || true
-          docker rm rag-app || true
-
-          # Pull the fresh image from ECR
-          docker pull ${{ steps.login-ecr.outputs.registry }}/${{ secrets::ECR_REPOSITORY }}:latest
-
-          # Run the new container, exposing Streamlit's port 8501
-          docker run -d \
+        
+    - name: Deploy the App Locally
+      run: |
+        # Stop existing container if it exists
+        docker stop rag-app || true
+        docker rm rag-app || true
+        
+        # Pull fresh image from ECR
+        docker pull ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:latest
+        
+        # Run it locally on the runner
+        docker run -d \
             --name rag-app \
             -p 8501:8501 \
-            -e AWS_S3_BUCKET_NAME="your-s3-bucket-name" \
-            -e GOOGLE_API_KEY="your-google-api-key" \
-            -e PINECONE_API_KEY="your-pinecone-api-key" \
-            -e PINECONE_INDEX_NAME="pinecone-llama-rag" \
-            ${{ steps.login-ecr.outputs.registry }}/${{ secrets::ECR_REPOSITORY }}:latest
+            -e AWS_S3_BUCKET_NAME="${{ secrets.AWS_S3_BUCKET_NAME }}" \
+            -e GOOGLE_API_KEY="${{ secrets.GOOGLE_API_KEY }}" \
+            -e PINECONE_API_KEY="${{ secrets.PINECONE_API_KEY }}" \
+            -e PINECONE_INDEX_NAME="${{ secrets.PINECONE_INDEX_NAME }}" \
+            ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:latest
