@@ -1,18 +1,17 @@
-name: Deploy via Self-Hosted Runner
+name: EC2 Single Container Deployment
 
 on:
   push:
-    branches:
-      - main
+    branches: [ "main" ] # Triggers whenever you push to the main branch
 
 jobs:
   deploy:
-    runs-on: self-hosted  # This tells GitHub to run the job directly on your EC2 instance
-
+    runs-on: ubuntu-latest
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
 
+    # 1. Authenticate with AWS using your GitHub Secrets
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
@@ -20,34 +19,59 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
 
-    - name: Log in to Amazon ECR
+    # 2. Log in to your private Amazon ECR
+    - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Build, Tag, and Push Docker Image
+    # 3. Build the Docker image and push it to ECR
+    - name: Build and Push to ECR
       env:
+        REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      run: |
+        docker build -t $REGISTRY/$REPOSITORY:latest .
+        docker push $REGISTRY/$REPOSITORY:latest
+
+    # 4. SSH into the EC2 instance, pull the new image, and run it
+    - name: SSH Deploy to EC2 Instance
+      uses: appleboy/ssh-action@v1.0.3
+      env:
+        # Pass the secrets securely into the SSH environment
+        GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+        PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+        PINECONE_INDEX_NAME: ${{ secrets.PINECONE_INDEX_NAME }}
+        AWS_S3_BUCKET_NAME: ${{ secrets.AWS_S3_BUCKET_NAME }}
+        AWS_REGION: ${{ secrets.AWS_REGION }}
         ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-        IMAGE_TAG: latest
-      run: |
-        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-        
-    - name: Deploy the App Locally
-      run: |
-        # Stop existing container if it exists
-        docker stop rag-app || true
-        docker rm rag-app || true
-        
-        # Pull fresh image from ECR
-        docker pull ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:latest
-        
-        # Run it locally on the runner
-        docker run -d \
-            --name rag-app \
+      with:
+        host: ${{ secrets.EC2_HOST }}
+        username: ${{ secrets.EC2_USERNAME }}
+        key: ${{ secrets.EC2_SSH_KEY }}
+        envs: GOOGLE_API_KEY,PINECONE_API_KEY,PINECONE_INDEX_NAME,AWS_S3_BUCKET_NAME,AWS_REGION,ECR_REGISTRY,ECR_REPOSITORY
+        script: |
+          # Install docker if it is missing on the EC2 host
+          if ! command -v docker &> /dev/null; then
+            sudo apt-get update && sudo apt-get install -y docker.io
+          fi
+          
+          # Authenticate Docker on the EC2 instance with AWS ECR
+          aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $ECR_REGISTRY
+          
+          # Pull the newly built image from ECR
+          sudo docker pull $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          # Stop and remove the old container if it exists
+          sudo docker stop rag-app || true
+          sudo docker rm rag-app || true
+          
+          # Boot up the fresh container and pass in the production API keys
+          sudo docker run -d --name rag-app \
             -p 8501:8501 \
-            -e AWS_S3_BUCKET_NAME="${{ secrets.AWS_S3_BUCKET_NAME }}" \
-            -e GOOGLE_API_KEY="${{ secrets.GOOGLE_API_KEY }}" \
-            -e PINECONE_API_KEY="${{ secrets.PINECONE_API_KEY }}" \
-            -e PINECONE_INDEX_NAME="${{ secrets.PINECONE_INDEX_NAME }}" \
-            ${{ steps.login-ecr.outputs.registry }}/${{ secrets.ECR_REPOSITORY }}:latest
+            -e GOOGLE_API_KEY="$GOOGLE_API_KEY" \
+            -e PINECONE_API_KEY="$PINECONE_API_KEY" \
+            -e PINECONE_INDEX_NAME="$PINECONE_INDEX_NAME" \
+            -e AWS_S3_BUCKET_NAME="$AWS_S3_BUCKET_NAME" \
+            --restart unless-stopped \
+            $ECR_REGISTRY/$ECR_REPOSITORY:latest

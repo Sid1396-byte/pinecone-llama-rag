@@ -14,7 +14,8 @@ COPY . .
 
 RUN chmod +x start.sh
 
-# Expose Streamlit's port to the public network
 EXPOSE 8501
+
+HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health
 
 CMD ["./start.sh"]
