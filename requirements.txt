@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+python-multipart
+google-genai
+pinecone>=4.0.0
+pypdf
+python-dotenv
+streamlit
+requests
+boto3
