@@ -1,7 +1,7 @@
 import streamlit as st
 import requests
 
-FASTAPI_URL = "http://127.0.0.1:8080"
+FASTAPI_URL = "http://localhost:8080"
 
 st.set_page_config(page_title="Llama + Gemini RAG App", layout="centered")
 st.title("📚 Llama & Gemini Flash RAG App")
