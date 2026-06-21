@@ -5,8 +5,11 @@ from config import settings
 
 def clean_extracted_text(text: str) -> str:
     """Removes non-printable characters, weird spacing, and ligatures from PDFs."""
-    text = re.sub(r'[ \t]+', ' ', text)
+    # 1. Remove null/weird bytes FIRST
     text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\xff]', '', text)
+    # 2. THEN collapse the spaces and tabs
+    text = re.sub(r'[ \t]+', ' ', text)
+    # 3. Finally, format the newlines
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
