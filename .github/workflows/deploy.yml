@@ -1,17 +1,49 @@
-name: EC2 Single Container Deployment
+name: EC2 Self-Hosted Deployment
 
 on:
   push:
-    branches: [ "main" ] # Triggers whenever you push to the main branch
+    branches: [ "main" ]
+  # --- NEW: MANUAL ROLLBACK TRIGGER ---
+  workflow_dispatch:
+    inputs:
+      rollback_tag:
+        description: 'Commit SHA to rollback to (Leave empty for normal deploy)'
+        required: false
+        default: ''
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64]
+    env:
+      # Use the provided rollback SHA, or default to the current commit SHA
+      DEPLOY_TAG: ${{ inputs.rollback_tag || github.sha }}
+    
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    # 1. Authenticate with AWS using your GitHub Secrets
+    # --- UNIT & INTEGRATION TESTING ---
+    # Skip tests if this is a manual rollback to a previously working image
+    - name: Set up Python
+      if: ${{ inputs.rollback_tag == '' }}
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        
+    - name: Install Dependencies & Run Tests
+      if: ${{ inputs.rollback_tag == '' }}
+      env:
+        GOOGLE_API_KEY: "dummy"
+        PINECONE_API_KEY: "dummy"
+        PINECONE_INDEX_NAME: "test-index"
+        AWS_S3_BUCKET_NAME: "test-bucket"
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+        pip install pytest httpx pytest-asyncio
+        pytest tests/
+
+    # --- AWS & ECR AUTHENTICATION ---
     - name: Configure AWS Credentials
       uses: aws-actions/configure-aws-credentials@v4
       with:
@@ -19,64 +51,76 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: ${{ secrets.AWS_REGION }}
 
-    # 2. Log in to your private Amazon ECR
     - name: Login to Amazon ECR
       id: login-ecr
       uses: aws-actions/amazon-ecr-login@v2
 
-    # 3. Build the Docker image and push it to ECR
+    # --- BUILD & PUSH TO REGISTRY ---
+    # Skip build step if we are rolling back (the image already exists in ECR)
     - name: Build and Push to ECR
+      if: ${{ inputs.rollback_tag == '' }}
       env:
         REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
       run: |
-        docker build -t $REGISTRY/$REPOSITORY:latest .
+        # Tag with both the immutable Git SHA and 'latest'
+        docker build -t $REGISTRY/$REPOSITORY:${{ env.DEPLOY_TAG }} -t $REGISTRY/$REPOSITORY:latest .
+        docker push $REGISTRY/$REPOSITORY:${{ env.DEPLOY_TAG }}
         docker push $REGISTRY/$REPOSITORY:latest
 
-    # 4. SSH into the EC2 instance, pull the new image, and run it
-    - name: SSH Deploy to EC2 Instance
-      uses: appleboy/ssh-action@v1.0.3
+    # --- DEPLOYMENT WITH AUTOMATED ROLLBACK ---
+    - name: Deploy Docker Container Locally
       env:
-        # Pass the secrets securely into the SSH environment
         GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
         PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
         PINECONE_INDEX_NAME: ${{ secrets.PINECONE_INDEX_NAME }}
         AWS_S3_BUCKET_NAME: ${{ secrets.AWS_S3_BUCKET_NAME }}
         AWS_REGION: ${{ secrets.AWS_REGION }}
-        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-        ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
         AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      with:
-        host: ${{ secrets.EC2_HOST }}
-        username: ${{ secrets.EC2_USERNAME }}
-        key: ${{ secrets.EC2_SSH_KEY }}
-        envs: GOOGLE_API_KEY,PINECONE_API_KEY,PINECONE_INDEX_NAME,AWS_S3_BUCKET_NAME,AWS_REGION,ECR_REGISTRY,ECR_REPOSITORY,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY
-        script: |
-          # Install docker if it is missing on the EC2 host
-          if ! command -v docker &> /dev/null; then
-            sudo apt-get update && sudo apt-get install -y docker.io
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+      run: |
+        # 1. Identify and backup the currently running container
+        OLD_CONTAINER_ID=$(sudo docker ps -q --filter name=rag-app)
+        if [ ! -z "$OLD_CONTAINER_ID" ]; then
+          echo "Backing up current container..."
+          sudo docker rename rag-app rag-app-backup
+          sudo docker stop rag-app-backup
+        fi
+        
+        # 2. Pull and start the specific image tag
+        echo "Deploying image tag: ${{ env.DEPLOY_TAG }}"
+        sudo docker run -d --name rag-app \
+          -p 8501:8501 \
+          -p 8080:8080 \
+          -e GOOGLE_API_KEY="$GOOGLE_API_KEY" \
+          -e PINECONE_API_KEY="$PINECONE_API_KEY" \
+          -e PINECONE_INDEX_NAME="$PINECONE_INDEX_NAME" \
+          -e AWS_S3_BUCKET_NAME="$AWS_S3_BUCKET_NAME" \
+          -e AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
+          -e AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
+          -e AWS_DEFAULT_REGION="$AWS_REGION" \
+          --restart unless-stopped \
+          $ECR_REGISTRY/$ECR_REPOSITORY:${{ env.DEPLOY_TAG }}
+          
+        # 3. Automated Health Check (Wait 10s to ensure it doesn't crash)
+        echo "Waiting for container to initialize..."
+        sleep 10
+        IS_RUNNING=$(sudo docker inspect --format='{{.State.Running}}' rag-app)
+        
+        # 4. Rollback Logic
+        if [ "$IS_RUNNING" != "true" ]; then
+          echo "🚨 New container crashed on startup! Initiating automatic rollback..."
+          sudo docker rm -f rag-app
+          
+          if [ ! -z "$OLD_CONTAINER_ID" ]; then
+            echo "Restoring previous version..."
+            sudo docker rename rag-app-backup rag-app
+            sudo docker start rag-app
           fi
-          
-          # Authenticate Docker on the EC2 instance with AWS ECR
-          aws ecr get-login-password --region $AWS_REGION | sudo docker login --username AWS --password-stdin $ECR_REGISTRY
-          
-          # Pull the newly built image from ECR
-          sudo docker pull $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          
-          # Stop and remove the old container if it exists
-          sudo docker stop rag-app || true
-          sudo docker rm rag-app || true
-          
-          # Boot up the fresh container and pass in all required API and AWS keys
-          sudo docker run -d --name rag-app \
-            -p 8501:8501 \
-            -e GOOGLE_API_KEY="$GOOGLE_API_KEY" \
-            -e PINECONE_API_KEY="$PINECONE_API_KEY" \
-            -e PINECONE_INDEX_NAME="$PINECONE_INDEX_NAME" \
-            -e AWS_S3_BUCKET_NAME="$AWS_S3_BUCKET_NAME" \
-            -e AWS_ACCESS_KEY_ID="$AWS_ACCESS_KEY_ID" \
-            -e AWS_SECRET_ACCESS_KEY="$AWS_SECRET_ACCESS_KEY" \
-            -e AWS_DEFAULT_REGION="$AWS_REGION" \
-            --restart unless-stopped \
-            $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          exit 1 # Fail the pipeline run so you know the push was bad
+        else
+          echo "✅ Deployment stable! Cleaning up backup..."
+          sudo docker rm -f rag-app-backup || true
+        fi
